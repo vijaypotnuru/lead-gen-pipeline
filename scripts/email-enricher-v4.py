@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
 """
-Email Enricher v4 — Multi-strategy free email finder.
-Strategies (tried in order until email found):
-  1. Website scraping (/contact, /about, / pages) 
-  2. SMTP handshake verification of common patterns (info@, contact@, etc.)
-  3. Person-specific email guessing (if people data exists) via SMTP
-
-No paid APIs. No rate limits. Just pattern matching + SMTP verification.
+Email Enricher v4 — Multi-strategy cascade with timeouts.
+Fast: per-lead 15s timeout, DNS pre-check, quick SMTP, minimal patterns.
 """
 
-import argparse, json, random, re, smtplib, socket, time
+import argparse, json, random, re, smtplib, socket, signal, time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,21 +16,15 @@ import requests
 LEADS_DIR = Path("/mnt/d/leads-folder")
 DEFAULT_FILES = ["ryzentic_maps.json", "grovitt_maps.json", "company_tech_signals.json"]
 TEAM_PAGES = ["/contact", "/about", "/about-us", "/"]
-MIN_DELAY, MAX_DELAY = 0.5, 2.0
-TIMEOUT = 12
+MIN_DELAY, MAX_DELAY = 0.3, 1.0
+TIMEOUT = 5
+SMTP_TIMEOUT = 2
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/133.0.0.0 Safari/537.36"
 MAX_LEADS_PER_RUN = 30
-MIN_SCORE = 3
-SMTP_TIMEOUT = 5
-SMTP_PORTS = [25, 587]
+MIN_SCORE = 2
+PER_LEAD_TIMEOUT = 15  # seconds max per lead
 
-GENERIC_PREFIXES = ["info", "contact", "hello", "hi", "support", "sales", "admin", "mail", "office", "team", "help"]
-
-@dataclass
-class Person:
-    name: str = ""; role: str = ""; linkedin: str = ""
-    twitter: str = ""; github: str = ""; email: str = ""
-    def to_dict(self): return {k: v for k, v in asdict(self).items() if v}
+GENERIC_PREFIXES = ["info", "contact", "hello", "hi", "support", "sales", "admin", "mail", "help"]
 
 @dataclass
 class Lead:
@@ -73,6 +62,26 @@ def normalize_url(raw: str) -> Optional[str]:
         p = urlparse(raw); return f"{p.scheme}://{p.netloc}" if p.netloc else None
     except: return None
 
+def get_domain_from_url(url: str) -> str:
+    p = urlparse(url)
+    d = p.netloc.lower()
+    return d[4:] if d.startswith("www.") else d
+
+class TimeoutError(Exception): pass
+
+def _alarm_handler(signum, frame):
+    raise TimeoutError("Lead enrichment timed out")
+
+def with_timeout(seconds: int, func, *args, **kwargs):
+    """Run func with a timeout using signal alarm (Unix only)."""
+    old_handler = signal.signal(signal.SIGALRM, _alarm_handler)
+    signal.alarm(seconds)
+    try:
+        return func(*args, **kwargs)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
+
 # --- Strategy 1: Website scraping ---
 
 def extract_emails_from_html(html: str) -> List[str]:
@@ -81,7 +90,6 @@ def extract_emails_from_html(html: str) -> List[str]:
     text = re.sub(r"<style[^>]*>.*?</style>", "", text, flags=re.DOTALL | re.I)
     text = re.sub(r"<[^>]+>", " ", text)
     text = _hlib.unescape(text)
-
     emails, seen = [], set()
     for m in re.finditer(r'[\w.+-]+@[\w-]+\.[\w.]+', text, re.I):
         email = m.group(0).lower().strip(".")
@@ -93,20 +101,28 @@ def extract_emails_from_html(html: str) -> List[str]:
 
 def scrape_website_emails(base_url: str, session: requests.Session) -> List[str]:
     all_emails = []
-    # Try both www and non-www variants
-    urls_to_try = [base_url]
-    if base_url.startswith("http://www."):
-        urls_to_try.append(base_url.replace("http://www.", "http://", 1))
-    elif base_url.startswith("https://www."):
-        urls_to_try.append(base_url.replace("https://www.", "https://", 1))
+    domain = get_domain_from_url(base_url)
+    # Try both with and without www prefix
+    variants = [base_url]
+    if base_url.startswith("https://www."):
+        variants.append(base_url.replace("https://www.", "https://", 1))
+    elif base_url.startswith("http://www."):
+        variants.append(base_url.replace("http://www.", "http://", 1))
+    elif base_url.startswith("https://"):
+        variants.append(base_url.replace("https://", "https://www.", 1))
+    elif base_url.startswith("http://"):
+        variants.append(base_url.replace("http://", "http://www.", 1))
 
-    for base in urls_to_try:
+    for base in variants:
         for page in TEAM_PAGES:
             url = base.rstrip("/") + page if page != "/" else base
             try:
-                r = session.get(url, timeout=TIMEOUT, headers={"User-Agent": UA}, allow_redirects=True, verify=False)
+                r = session.get(url, timeout=TIMEOUT, headers={"User-Agent": UA},
+                                allow_redirects=True, verify=False)
                 if r.status_code == 200 and len(r.text) > 300:
-                    all_emails.extend(extract_emails_from_html(r.text))
+                    emails = extract_emails_from_html(r.text)
+                    domain_emails = [e for e in emails if domain in e.split("@")[-1]]
+                    all_emails.extend(domain_emails)
                     if all_emails:
                         break
             except Exception:
@@ -121,109 +137,128 @@ def get_mx_servers(domain: str) -> List[str]:
     try:
         import dns.resolver
         answers = dns.resolver.resolve(domain, 'MX', lifetime=2)
-        return [str(a.exchange).rstrip('.') for a in sorted(answers, key=lambda a: a.preference)]
+        hosts = [str(a.exchange).rstrip('.') for a in sorted(answers, key=lambda a: a.preference)]
+        # Verify at least one resolves
+        for h in hosts:
+            try:
+                socket.getaddrinfo(h, None)
+                return hosts
+            except socket.gaierror:
+                pass
     except Exception:
         pass
-    return [f"mail.{domain}", domain]
-
-def smtp_port_reachable(host: str) -> int:
-    """Return first reachable SMTP port, or 0 if none."""
-    for port in SMTP_PORTS:
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(3)
-            r = s.connect_ex((host, port))
-            s.close()
-            if r == 0: return port
-        except: pass
-    return 0
-
-def check_smtp_email(email: str, mx_host: str, port: int) -> bool:
     try:
-        with smtplib.SMTP(mx_host, port, timeout=SMTP_TIMEOUT) as smtp:
+        socket.getaddrinfo(f"mail.{domain}", None)
+        return [f"mail.{domain}"]
+    except socket.gaierror:
+        pass
+    return []
+
+def check_smtp_email(email: str, mx_host: str) -> bool:
+    try:
+        with smtplib.SMTP(mx_host, 25, timeout=SMTP_TIMEOUT) as smtp:
             smtp.ehlo_or_helo_if_needed()
             smtp.mail("verify@example.com")
             code, _ = smtp.rcpt(email)
             return code == 250
-    except: return False
+    except Exception:
+        return False
 
-def check_email_fast(email: str, mx_host: str) -> bool:
-    port = smtp_port_reachable(mx_host)
-    if not port: return False
-    return check_smtp_email(email, mx_host, port)
-
-def guess_generic_emails(domain: str, mx_host: str) -> List[str]:
+def guess_generic_emails(domain: str, mx_hosts: List[str]) -> List[str]:
+    if not mx_hosts:
+        return []
     found = []
+    mx = mx_hosts[0]
     for prefix in GENERIC_PREFIXES:
         email = f"{prefix}@{domain}"
-        if check_email_fast(email, mx_host):
+        if check_smtp_email(email, mx):
             found.append(email)
-            if len(found) >= 2: break
+            if len(found) >= 2:
+                break
+        time.sleep(0.05)
     return found
 
-def guess_person_email(name: str, domain: str, mx_host: str) -> str:
-    if not name or not domain: return ""
+def guess_person_email(name: str, domain: str, mx_hosts: List[str]) -> str:
+    if not name or not domain or not mx_hosts:
+        return ""
+    name = re.sub(r'\s+\d+[a-z0-9]+$', '', name.strip(), flags=re.I)
     parts = name.lower().split()
-    if len(parts) < 2: return ""
+    if len(parts) < 2:
+        return ""
     first, last = parts[0], parts[-1]
     fi = first[0] if first else ""
-    li = last[0] if last else ""
 
     patterns = [
-        f"{first}.{last}@{domain}", f"{fi}{last}@{domain}", f"{first}@{domain}",
-        f"{first}_{last}@{domain}", f"{fi}.{last}@{domain}", f"{first}{last}@{domain}",
-        f"{first}.{li}@{domain}", f"{fi}_{last}@{domain}", f"{last}@{domain}",
+        f"{first}.{last}@{domain}",
+        f"{fi}{last}@{domain}",
+        f"{first}@{domain}",
+        f"{first}_{last}@{domain}",
+        f"{last}@{domain}",
     ]
+    mx = mx_hosts[0]
     for email in patterns:
-        if check_email_fast(email, mx_host):
+        if check_smtp_email(email, mx):
             return email
+        time.sleep(0.05)
     return ""
 
 # --- Main enrich ---
 
-def enrich_lead(lead: Lead, session: requests.Session) -> int:
+def enrich_lead_core(lead: Lead, session: requests.Session) -> int:
     base = normalize_url(lead.website)
-    if not base: return 0
+    if not base:
+        return 0
 
-    domain = urlparse(base).netloc.lower().lstrip("www.")
-    if not domain: return 0
+    domain = get_domain_from_url(base)
+    if not domain:
+        return 0
 
     emails_found = 0
 
     # Strategy 1: Website scraping
     if not lead.contact_email:
         scraped = scrape_website_emails(base, session)
-        domain_emails = [e for e in scraped if domain in e.split("@")[-1]]
-        if domain_emails:
-            lead.contact_email = domain_emails[0]
+        if scraped:
+            lead.contact_email = scraped[0]
             emails_found += 1
-            extras = domain_emails[1:3]
-            if extras:
-                lead.notes = (lead.notes or "") + f" | More: {', '.join(extras)}"
+            if len(scraped) > 1:
+                lead.notes = (lead.notes or "") + f" | More: {', '.join(scraped[1:3])}"
                 lead.notes = lead.notes.strip(" |")
 
-    # Pick best MX server
-    mx_hosts = get_mx_servers(domain)
-    mx_host = mx_hosts[0] if mx_hosts else None
-
-    # Strategy 2: SMTP generic guessing
-    if not lead.contact_email and mx_host:
-        generic = guess_generic_emails(domain, mx_host)
-        if generic:
-            lead.contact_email = generic[0]
-            emails_found += 1
-
-    # Strategy 3: Person-specific emails
-    if lead.people and mx_host:
-        for pdict in lead.people:
-            if pdict.get("email"): continue
-            name = pdict.get("name", "")
-            guessed = guess_person_email(name, domain, mx_host)
-            if guessed:
-                pdict["email"] = guessed
+    # Strategy 2: SMTP generic
+    if not lead.contact_email:
+        mx_hosts = get_mx_servers(domain)
+        if mx_hosts:
+            generic = guess_generic_emails(domain, mx_hosts)
+            if generic:
+                lead.contact_email = generic[0]
                 emails_found += 1
 
+    # Strategy 3: Person-specific emails
+    if lead.people:
+        mx_hosts = get_mx_servers(domain)
+        if mx_hosts:
+            for pdict in lead.people:
+                if pdict.get("email"):
+                    continue
+                name = pdict.get("name", "")
+                if not name or len(name) < 3 or ' ' not in name:
+                    continue
+                guessed = guess_person_email(name, domain, mx_hosts)
+                if guessed:
+                    pdict["email"] = guessed
+                    emails_found += 1
+
     return emails_found
+
+def enrich_lead(lead: Lead, session: requests.Session) -> int:
+    """Wrapper with timeout."""
+    try:
+        return with_timeout(PER_LEAD_TIMEOUT, enrich_lead_core, lead, session)
+    except TimeoutError:
+        return 0
+    except Exception:
+        return 0
 
 # --- Orchestrate ---
 

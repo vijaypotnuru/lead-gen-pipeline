@@ -328,11 +328,11 @@ def parse_maps_page(response, query: str, city: str, routing: str) -> List[Lead]
     leads: List[Lead] = []
 
     # Primary strategy: role="article" elements
-    cards = response.css('[role="article"]')
+    cards = response.css('[role="article"]', auto_save=True)
 
     if not cards:
         # Fallback: parent divs of place links
-        place_links = response.css('a[href*="/maps/place/"]')
+        place_links = response.css('a[href*="/maps/place/"]', auto_save=True)
         seen_parents = set()
         for link in place_links:
             parent = link.parent
