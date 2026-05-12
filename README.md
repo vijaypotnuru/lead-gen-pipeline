@@ -43,15 +43,20 @@ HN Who is Hiring         →    80 startup signals
 | `startup-lead-scraper.py` | BetaList, HN Show, GitHub startup signals | — |
 | `hn-hiring-scraper.py` | HN Who is Hiring standalone | — |
 
-## Email Enricher v4 — How It Works
+## Enrichment — How It Works (v2.0)
 
-Multi-strategy cascade (tries in order):
+**Unified Scrapling enricher** — single pass per lead discovers both people AND emails:
 
-1. **Website scraping** — crawls `/contact`, `/about`, `/about-us`, `/` for email addresses
-2. **SMTP pattern guessing** — tries common prefixes (info@, contact@, sales@, etc.) and verifies via SMTP MX handshake
-3. **Person email guessing** — when people data exists, generates 9+ email patterns per person and SMTP-verifies each
+1. **StealthyFetcher** (headless browser) fetches company website with anti-bot bypass
+2. **`find_by_text()`** — locates "Our Team", "Leadership", "About Us" sections by text content
+3. **`find_similar()`** — once one person card is found, automatically discovers all similar cards
+4. **Email extraction** — regex from rendered page text + SMTP MX handshake verification for generic patterns (info@, contact@, etc.)
+5. **Person email guessing** — generates 9+ email patterns per known person name and SMTP-verifies each
 
-**No paid APIs. Zero cost.**
+**Features:** `auto_save=True` on all selectors (survives site redesigns), `StealthyFetcher.adaptive` (bypasses Cloudflare),
+concurrent-ready Spider framework for scale.
+
+**Zero paid APIs. Pure Scrapling + SMTP.**
 
 ## Quick Start
 
