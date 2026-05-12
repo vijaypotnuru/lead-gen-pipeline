@@ -1,7 +1,7 @@
 ---
 name: lead-generation-pipeline
 description: End-to-end lead generation pipeline using Scrapling for Google Maps scraping, GitHub trending, HN hiring signals, and Google Sheets for structured output. Automates lead discovery, scoring, routing, and sheet population for sales outreach. Use when asked to generate leads, find businesses, do market research, or populate prospect sheets.
-version: "1.1.0"
+version: "2.0.0"
 license: MIT
 metadata:
   openclaw:
@@ -11,6 +11,8 @@ metadata:
       env:
         - GOG_KEYRING_PASSWORD
         - GOG_ACCOUNT
+      skills:
+        - scrapling-official
 ---
 
 # Lead Generation Pipeline
