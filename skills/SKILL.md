@@ -13,6 +13,7 @@ metadata:
         - GOG_ACCOUNT
       skills:
         - scrapling-official
+        - multi-search-engine
 ---
 
 # Lead Generation Pipeline
